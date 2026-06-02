@@ -13,12 +13,7 @@ Käyttö:
 
 import os, sys
 from datetime import datetime
-
-try:
-    from openpyxl import Workbook
-except ImportError:
-    print("Virhe: openpyxl puuttuu. Asenna: pip install openpyxl")
-    sys.exit(1)
+from openpyxl import Workbook
 
 from measurement import Measurement, save_measurements_sheet, append_measurement
 from health import load_config
