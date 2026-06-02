@@ -14,7 +14,6 @@ Käyttö:
 import os, sys
 from datetime import datetime
 from openpyxl import Workbook
-
 from measurement import Measurement, save_measurements_sheet, append_measurement
 from health import load_config
 
@@ -42,7 +41,7 @@ def create_new_file(filename: str) -> None:
 
 if __name__ == "__main__":
     cfg = load_config()
-    filename = cfg["tiedosto"]
+    filename = cfg["filename"]
 
     # Keksityt mittausarvot — tämän päivän aikaleimalla
     m = Measurement( timestamp = datetime.now(), glucose_mmol=5.8, weight=78.4, systolic=128, diastolic=82, pulse=65,

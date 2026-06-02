@@ -198,3 +198,89 @@ def append_measurement(filename: str, m: Measurement) -> None:
         ws.cell(next_row, col).border = border
 
     wb.save(filename)
+
+
+def merge_or_append_measurements(filename: str, measurements: list) -> tuple:
+    """Yhdistää uudet mittaukset olemassa olevaan 'Mittaukset'-välilehteen
+    päivätasolla.
+
+    Jokaisen Measurement-olion kohdalla:
+      - Etsitään saman päivän rivit (timestamp-sarakkeesta verrataan DD.MM.YYYY-osaa).
+      - Jos rivi löytyy ja kaikki sarakkeet, joihin uusi olio toisi tietoja,
+        ovat tyhjiä → täytetään ne tyhjät kentät kyseiselle riville.
+      - Muuten kirjoitetaan uusi rivi taulukon perään.
+
+    Palauttaa tuplen (päivitettyjä rivejä, uusia rivejä).
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Border, Side
+
+    wb = load_workbook(filename)
+    ws = wb["Mittaukset"]
+    n_cols = len(Measurement.COLUMNS)
+
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Siivoa pois mahdollinen "Ei mittauksia." -placeholder
+    if ws.cell(2, 1).value == "Ei mittauksia.":
+        ws.cell(2, 1).value = None
+
+    def next_empty_row() -> int:
+        data_rows = 0
+        for row in range(2, ws.max_row + 1):
+            if any(ws.cell(row, col).value is not None
+                   for col in range(1, n_cols + 1)):
+                data_rows += 1
+        return 2 + data_rows
+
+    def add_borders(row: int) -> None:
+        for col in range(1, n_cols + 1):
+            ws.cell(row, col).border = border
+
+    updated, added = 0, 0
+
+    for m in measurements:
+        new_values = m.to_row()
+        target_date = (m.timestamp.strftime("%d.%m.%Y")
+                       if m.timestamp else None)
+        merged = False
+
+        if target_date is not None:
+            for row in range(2, ws.max_row + 1):
+                ts_str = ws.cell(row, 1).value
+                if not (isinstance(ts_str, str) and ts_str.startswith(target_date)):
+                    continue
+
+                # Ristiriita: uusi olio yrittää kirjoittaa sarakkeeseen, jossa
+                # on jo arvo. Aikaleimasarake (1) ohitetaan, sitä ei päivitetä.
+                conflict = any(
+                    new_values[col - 1] not in (None, "")
+                    and ws.cell(row, col).value is not None
+                    for col in range(2, n_cols + 1)
+                )
+                if conflict:
+                    continue
+
+                # Täytä tyhjät kentät
+                for col in range(2, n_cols + 1):
+                    val = new_values[col - 1]
+                    if val in (None, ""):
+                        continue
+                    cell = ws.cell(row=row, column=col, value=val)
+                    cell.alignment = Alignment(horizontal="center")
+                    if isinstance(val, float):
+                        cell.number_format = "0.0"
+                    cell.border = border
+                merged = True
+                updated += 1
+                break
+
+        if not merged:
+            row = next_empty_row()
+            m.write_row(ws, row)
+            add_borders(row)
+            added += 1
+
+    wb.save(filename)
+    return updated, added

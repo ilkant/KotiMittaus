@@ -729,8 +729,8 @@ def load_config(config_file: str = "settings.ini") -> dict:
         "contour":    None,
         "omron":      None,
         "beurer":     None,
-        "hakemisto":  None,
-        "tiedosto":   "terveysmittaukset.xlsx",
+        "directory":  None,
+        "filename":   "terveysmittaukset.xlsx",
     }
 
     # Etsi asetustiedosto ohjelman hakemistosta tai nykyisestä hakemistosta
@@ -748,30 +748,30 @@ def load_config(config_file: str = "settings.ini") -> dict:
     config.read(found_path, encoding="utf-8")
 
     # Lue MAC-osoitteet
-    if "laitteet" in config:
+    if "devices" in config:
         for key in ["contour", "omron", "beurer"]:
-            val = config["laitteet"].get(key, "").strip()
+            val = config["devices"].get(key, "").strip()
             if val:
                 defaults[key] = val
 
     # Lue asetukset
-    if "asetukset" in config:
+    if "settings" in config:
         now = datetime.now()
-        hakemisto = config["asetukset"].get("hakemisto", "").strip()
-        tiedosto  = config["asetukset"].get("tiedosto",  "terveysmittaukset.xlsx").strip()
+        directory = config["settings"].get("directory", "").strip()
+        filename  = config["settings"].get("filename",  "terveysmittaukset.xlsx").strip()
 
         # Korvaa päivämäärämuuttujat
-        tiedosto = tiedosto.replace("{vuosi}",    now.strftime("%Y"))
-        tiedosto = tiedosto.replace("{kuukausi}", now.strftime("%m"))
-        tiedosto = tiedosto.replace("{paiva}",    now.strftime("%d"))
+        filename = filename.replace("{year}",  now.strftime("%Y"))
+        filename = filename.replace("{month}", now.strftime("%m"))
+        filename = filename.replace("{day}",   now.strftime("%d"))
 
-        if hakemisto:
-            os.makedirs(hakemisto, exist_ok=True)
-            defaults["tiedosto"] = os.path.join(hakemisto, tiedosto)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+            defaults["filename"] = os.path.join(directory, filename)
         else:
-            defaults["tiedosto"] = tiedosto
+            defaults["filename"] = filename
 
-        defaults["hakemisto"] = hakemisto or script_dir
+        defaults["directory"] = directory or script_dir
 
     return defaults
 
@@ -813,7 +813,7 @@ Esimerkkejä:
     parser.add_argument("--kaikki",   action="store_true",
                         help="Lue kaikki kolme laitetta")
     parser.add_argument("--excel",    type=str, default=None,
-                        help=f"Tallennustiedosto (oletus: {cfg['tiedosto']})")
+                        help=f"Tallennustiedosto (oletus: {cfg['filename']})")
     parser.add_argument("--no-excel", action="store_true",
                         help="Näytä tulokset vain terminaalissa")
     args = parser.parse_args()
@@ -845,7 +845,7 @@ Esimerkkejä:
     if not glucose_results and not bp_results and not scale_results:
         print("\nEi mittauksia saatu yhdeltäkään laitteelta."); sys.exit(1)
 
-    excel_file = args.excel or cfg["tiedosto"]
+    excel_file = args.excel or cfg["filename"]
     if not args.no_excel:
         # Jos tulostiedostoa ei vielä ole, luodaan se otsikkorivillä
         # samaan tapaan kuin testaus.py tekee.
