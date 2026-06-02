@@ -46,10 +46,7 @@ Paritusohjeet:
             (tai astu vaakaan — se aktivoi BT:n automaattisesti)
 """
 
-import asyncio
-import struct
-import argparse
-import sys
+import asyncio, struct, argparse, sys, os
 from datetime import datetime
 
 try:
@@ -58,6 +55,8 @@ try:
 except ImportError:
     print("Virhe: bleak-kirjasto puuttuu. Asenna: pip install bleak")
     sys.exit(1)
+
+from measurement import Measurement, combine_measurements, save_measurements_sheet
 
 # ── Contour GATT UUID:t ──────────────────────────────────────────────────────
 GLUCOSE_MEASUREMENT_UUID = "00002a18-0000-1000-8000-00805f9b34fb"
@@ -511,6 +510,14 @@ def save_to_excel(glucose: list, bp: list, scale: list, filename: str):
         return
 
     wb = Workbook()
+    # Poista oletusvälilehti — luomme välilehdet itse
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    # ── Mittaukset-välilehti (yhdistetty taulukko, Measurement-oliot) ────────
+    measurements = combine_measurements(glucose, bp, scale)
+    save_measurements_sheet(wb, measurements)
+
     thin   = Side(style="thin", color="CCCCCC")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -535,8 +542,7 @@ def save_to_excel(glucose: list, bp: list, scale: list, filename: str):
         ws.add_chart(chart, anchor)
 
     # ── 1. Verensokeri ────────────────────────────────────────────────────────
-    ws_g = wb.active
-    ws_g.title = "Verensokeri"
+    ws_g = wb.create_sheet("Verensokeri")
     if glucose:
         for col, (h, w) in enumerate(zip(
             ["Järj.nro","Päivämäärä","Kellonaika","Verensokeri (mmol/L)","Huomio"],
@@ -680,12 +686,36 @@ def save_to_excel(glucose: list, bp: list, scale: list, filename: str):
     print(f"Avaa: libreoffice --calc {filename}")
 
 
+def create_new_file(filename: str) -> None:
+    """Luo uuden Excel-tiedoston, jossa on 'Mittaukset'-välilehti otsikoineen.
+
+    Käytetään silloin, kun tulostiedostoa ei vielä ole olemassa. Tarvittavat
+    hakemistot luodaan automaattisesti.
+    """
+    from openpyxl import Workbook
+
+    target_dir = os.path.dirname(filename)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    save_measurements_sheet(wb, [])  # luo välilehden otsikkorivillä
+    # save_measurements_sheet kirjoittaa tyhjään tauluun "Ei mittauksia." -solun;
+    # poistetaan se, jotta ensimmäinen varsinainen rivi voidaan kirjoittaa rivi 2:lle.
+    ws = wb["Mittaukset"]
+    if ws.cell(2, 1).value == "Ei mittauksia.":
+        ws.cell(2, 1).value = None
+    wb.save(filename)
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PÄÄOHJELMA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_config(config_file: str = "laitteet.ini") -> dict:
-    """Lue MAC-osoitteet ja asetukset laitteet.ini-tiedostosta."""
+def load_config(config_file: str = "settings.ini") -> dict:
+    """Lue MAC-osoitteet ja asetukset settings.ini-tiedostosta."""
     import configparser, os
     from datetime import datetime
     config = configparser.ConfigParser()
@@ -741,7 +771,9 @@ def load_config(config_file: str = "laitteet.ini") -> dict:
     return defaults
 
 
-def main():
+
+
+if __name__ == "__main__":
     # Lue MAC-osoitteet asetustiedostosta
     cfg = load_config()
 
@@ -749,7 +781,7 @@ def main():
         description="Terveysmittaukset BLE-lukija (Contour + Omron M7 + Beurer BF720)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-MAC-osoitteet luetaan tiedostosta laitteet.ini (sama hakemisto kuin ohjelma).
+MAC-osoitteet luetaan tiedostosta settings.ini (sama hakemisto kuin ohjelma).
 Tällä hetkellä asetustiedostossa:
   contour = {cfg['contour'] or 'ei asetettu'}
   omron   = {cfg['omron']   or 'ei asetettu'}
@@ -757,9 +789,9 @@ Tällä hetkellä asetustiedostossa:
 
 Esimerkkejä:
   python3 terveysmittaukset.py --scan
-  python3 terveysmittaukset.py --contour        (käyttää laitteet.ini osoitetta)
-  python3 terveysmittaukset.py --omron          (käyttää laitteet.ini osoitetta)
-  python3 terveysmittaukset.py --beurer         (käyttää laitteet.ini osoitetta)
+  python3 terveysmittaukset.py --contour        (käyttää settings.ini osoitetta)
+  python3 terveysmittaukset.py --omron          (käyttää settings.ini osoitetta)
+  python3 terveysmittaukset.py --beurer         (käyttää settings.ini osoitetta)
   python3 terveysmittaukset.py --kaikki         (lukee kaikki kolme laitetta)
   python3 terveysmittaukset.py --contour AA:BB:CC:DD:EE:FF  (ylikirjoittaa ini-osoitteen)
   python3 terveysmittaukset.py --kaikki --excel toukokuu.xlsx
@@ -768,11 +800,11 @@ Esimerkkejä:
     parser.add_argument("--scan",     action="store_true",
                         help="Etsi BLE-laitteita lähistöltä")
     parser.add_argument("--contour",  nargs="?", const=cfg["contour"], metavar="MAC",
-                        help="Lue verensokeri (MAC laitteet.ini:stä tai anna itse)")
+                        help="Lue verensokeri (MAC settings.ini:stä tai anna itse)")
     parser.add_argument("--omron",    nargs="?", const=cfg["omron"],   metavar="MAC",
-                        help="Lue verenpaine (MAC laitteet.ini:stä tai anna itse)")
+                        help="Lue verenpaine (MAC settings.ini:stä tai anna itse)")
     parser.add_argument("--beurer",   nargs="?", const=cfg["beurer"],  metavar="MAC",
-                        help="Lue paino (MAC laitteet.ini:stä tai anna itse)")
+                        help="Lue paino (MAC settings.ini:stä tai anna itse)")
     parser.add_argument("--kaikki",   action="store_true",
                         help="Lue kaikki kolme laitetta")
     parser.add_argument("--excel",    type=str, default=None,
@@ -782,7 +814,7 @@ Esimerkkejä:
     args = parser.parse_args()
 
     if args.scan:
-        asyncio.run(scan_devices()); return
+        asyncio.run(scan_devices()); sys.exit(0)
 
     # --kaikki käyttää ini-tiedoston osoitteita
     if args.kaikki:
@@ -798,7 +830,7 @@ Esimerkkejä:
                       ("--omron",   args.omron),
                       ("--beurer",  args.beurer)]:
         if mac == cfg.get(name.lstrip("-")) and not mac:
-            print(f"Virhe: {name} MAC-osoite puuttuu laitteet.ini-tiedostosta!")
+            print(f"Virhe: {name} MAC-osoite puuttuu settings.ini-tiedostosta!")
             sys.exit(1)
 
     glucose_results = asyncio.run(read_contour(args.contour)) if args.contour else []
@@ -810,8 +842,9 @@ Esimerkkejä:
 
     excel_file = args.excel or cfg["tiedosto"]
     if not args.no_excel:
+        # Jos tulostiedostoa ei vielä ole, luodaan se otsikkorivillä
+        # samaan tapaan kuin testaus.py tekee.
+        if not os.path.exists(excel_file):
+            create_new_file(excel_file)
+            print(f"Luotu uusi tiedosto otsikkorivillä: {excel_file}")
         save_to_excel(glucose_results, bp_results, scale_results, excel_file)
-
-
-if __name__ == "__main__":
-    main()
