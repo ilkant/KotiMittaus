@@ -3,3 +3,6 @@ Ohjelma lukee bluetoothin kautta Contour Care -verensokerimittarin mittaustuloks
 Tällä hetkellä vaakaan saadaan luotettu bluetooth paritus, mutta tieto ei siirry.
 
 ToDo: Kaikki tiedot yhteen taulukkolaskenta-asiakirjaan yhdelle riville. Kuten koodaaja on tähän asti käsin tehnyt.
+
+
+Ohjelman käynnistys $ python health.py
