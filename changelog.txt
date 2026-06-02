@@ -1,0 +1,5 @@
+KotiMittaus ohjelmien Changelog.
+
+## [0.8.0] - 2026-06-02
+### Added
+- Health can add measurement to same row if there are not those values and new row if thre are values
