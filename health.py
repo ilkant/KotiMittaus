@@ -60,7 +60,7 @@ from measurement import (
     Measurement,
     combine_measurements,
     save_measurements_sheet,
-    merge_or_append_measurements,
+    append_measurement,
 )
 
 # ── Contour GATT UUID:t ──────────────────────────────────────────────────────
@@ -716,6 +716,131 @@ def create_new_file(filename: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# POLLAUS — laitteita minuutin välein, max 30 min
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def collect_devices(macs: dict,
+                          duration_minutes: int = 30,
+                          interval_seconds: int = 60) -> tuple:
+    """Skannaa annettuja laitteita kunnes kaikilta on saatu tiedot tai aika loppuu.
+
+    Käydään pollauskierroksia: jokaisella kierroksella yritetään lukea jokaista
+    hakulistalla vielä olevaa laitetta. Kun joltain laitteelta saadaan tiedot,
+    se poistetaan hakulistalta. Kierrosten välillä odotetaan kunnes minuutti
+    on kulunut kierroksen alusta. Lopetetaan kun kaikki valmiita tai
+    `duration_minutes` minuuttia on kulunut.
+
+    macs: {"contour": MAC|None, "omron": MAC|None, "beurer": MAC|None}
+          — vain ne avaimet, joilla on MAC, ovat hakulistalla.
+    Palauttaa tuplen (glucose_list, bp_list, scale_list).
+    """
+    pending = {name: mac for name, mac in macs.items() if mac}
+    results = {"contour": [], "omron": [], "beurer": []}
+    if not pending:
+        return [], [], []
+
+    readers = {
+        "contour": read_contour,
+        "omron":   read_omron,
+        "beurer":  read_beurer,
+    }
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + duration_minutes * 60
+
+    round_num = 0
+    while pending and loop.time() < deadline:
+        round_num += 1
+        round_start = loop.time()
+        remaining_min = (deadline - round_start) / 60
+        print(f"\n{'═' * 70}")
+        print(f"  Kierros {round_num}  ·  jäljellä {len(pending)} laitetta "
+              f"({', '.join(pending.keys())})  ·  aikaa {remaining_min:.1f} min")
+        print(f"{'═' * 70}")
+
+        done_now = []
+        for name in list(pending.keys()):
+            if loop.time() >= deadline:
+                break
+            mac = pending[name]
+            try:
+                data = await readers[name](mac)
+            except Exception as e:
+                print(f"[{name}] virhe: {e}")
+                data = []
+            if data:
+                results[name] = data
+                done_now.append(name)
+                print(f"[{name}] ✓ tiedot saatu — poistetaan hakulistalta.")
+
+        for name in done_now:
+            del pending[name]
+
+        if not pending or loop.time() >= deadline:
+            break
+
+        elapsed = loop.time() - round_start
+        wait = min(max(0.0, interval_seconds - elapsed),
+                   max(0.0, deadline - loop.time()))
+        if wait > 0:
+            print(f"\n[Odotetaan {wait:.0f} s seuraavaan pollauskierrokseen…]")
+            await asyncio.sleep(wait)
+
+    if pending:
+        print(f"\n⏱  Aikaraja {duration_minutes} min täynnä — ei saatu tietoja: "
+              f"{', '.join(pending.keys())}")
+
+    return results["contour"], results["omron"], results["beurer"]
+
+
+def build_combined_measurement(glucose: list, bp: list, scale: list) -> Measurement:
+    """Yhdistää eri laitteiden tuoreimmat lukemat yhdeksi Measurement-olioksi.
+
+    Jokaiselta laitteelta otetaan tuorein (suurin timestamp) lukema. Olion
+    aikaleimaksi tulee tuoreimman saadun lukeman aikaleima, tai nykyhetki,
+    jos yhdelläkään lukemalla ei ole aikaleimaa.
+    """
+    m = Measurement(timestamp=datetime.now())
+    latest_ts = None
+
+    def newest(items: list) -> dict | None:
+        with_ts = [x for x in items if x.get("timestamp")]
+        if with_ts:
+            return max(with_ts, key=lambda x: x["timestamp"])
+        return items[-1] if items else None
+
+    g = newest(glucose)
+    if g:
+        m.glucose_mmol = g.get("glucose_mmol")
+        if g.get("timestamp") and (latest_ts is None or g["timestamp"] > latest_ts):
+            latest_ts = g["timestamp"]
+
+    b = newest(bp)
+    if b:
+        m.systolic  = b.get("systolic")
+        m.diastolic = b.get("diastolic")
+        m.pulse     = b.get("pulse") or None
+        if b.get("timestamp") and (latest_ts is None or b["timestamp"] > latest_ts):
+            latest_ts = b["timestamp"]
+
+    s = newest(scale)
+    if s:
+        m.weight = s.get("weight")
+        m.fat    = s.get("fat")
+        m.water  = s.get("water")
+        m.muscle = s.get("muscle")
+        m.bone   = s.get("bone")
+        m.bmr    = s.get("bmr")
+        m.amr    = s.get("amr")
+        if s.get("timestamp") and (latest_ts is None or s["timestamp"] > latest_ts):
+            latest_ts = s["timestamp"]
+
+    if latest_ts is not None:
+        m.timestamp = latest_ts
+    return m
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PÄÄOHJELMA
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -838,26 +963,27 @@ Esimerkkejä:
             print(f"Virhe: {name} MAC-osoite puuttuu settings.ini-tiedostosta!")
             sys.exit(1)
 
-    glucose_results = asyncio.run(read_contour(args.contour)) if args.contour else []
-    bp_results      = asyncio.run(read_omron(args.omron))     if args.omron   else []
-    scale_results   = asyncio.run(read_beurer(args.beurer))   if args.beurer  else []
+    # Pollataan kaikkia annettuja laitteita minuutin välein max 30 min.
+    glucose_results, bp_results, scale_results = asyncio.run(
+        collect_devices({
+            "contour": args.contour,
+            "omron":   args.omron,
+            "beurer":  args.beurer,
+        })
+    )
 
     if not glucose_results and not bp_results and not scale_results:
         print("\nEi mittauksia saatu yhdeltäkään laitteelta."); sys.exit(1)
 
     excel_file = args.excel or cfg["filename"]
     if not args.no_excel:
-        # Jos tulostiedostoa ei vielä ole, luodaan se otsikkorivillä
-        # samaan tapaan kuin testaus.py tekee.
         if not os.path.exists(excel_file):
             create_new_file(excel_file)
             print(f"Luotu uusi tiedosto otsikkorivillä: {excel_file}")
 
-        # Yhdistä laitedatat Measurement-olioiksi ja kirjoita ne tiedostoon
-        # päivätason yhdistämislogiikalla: saman päivän olemassa olevan rivin
-        # tyhjät kentät täytetään, ristiriidan sattuessa luodaan uusi rivi.
-        measurements = combine_measurements(glucose_results, bp_results, scale_results)
-        updated, added = merge_or_append_measurements(excel_file, measurements)
-        print(f"\nMittaukset tallennettu tiedostoon {excel_file}")
-        print(f"  Päivitettyjä rivejä: {updated}")
-        print(f"  Uusia rivejä:        {added}")
+        m = build_combined_measurement(glucose_results, bp_results, scale_results)
+        print(f"\nLisätään uusi rivi tiedostoon {excel_file}:")
+        for (header, _), value in zip(Measurement.COLUMNS, m.to_row()):
+            print(f"  {header:<28} {value if value not in (None, '') else '-'}")
+        append_measurement(excel_file, m)
+        print(f"\nMittaus tallennettu onnistuneesti.")
