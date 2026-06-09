@@ -6,7 +6,11 @@ Sisältää:
     BodyCompositionMeasurement) — kussakin vain kyseisen laitteen kentät.
   • DEVICE_TYPES — laitelista, joka sitoo laiteavaimen sen mittausluokkaan.
   • Measurement — yhdistetty mittausrivi (yksi rivi Excel-taulukossa).
-  • Funktiot eri laitteiden mittausten yhdistämiseksi yhdeksi Excel-riviksi.
+  • combine_measurements_by_day — kokoaa laitteiden lukemat päivätasolle:
+    yksi Measurement per kalenteripäivä, tuorein lukema per laite.
+  • write_measurements_by_date — kirjoittaa mittaukset päiväpohjaiseen
+    taulukkoon (yksi rivi per päivä) oikean päivän riville. Täyttää vain
+    tyhjät solut: taulukossa jo oleva arvo ei koskaan ylikirjoitu.
 
 Uusi laite lisätään määrittelemällä sille oma mittausluokka ja rekisteröimällä
 se DEVICE_TYPES-listaan. Loput koodista käsittelee laitteet listan kautta.
