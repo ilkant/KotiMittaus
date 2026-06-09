@@ -1,5 +1,39 @@
 KotiMittaus ohjelmien Changelog.
 
+## [0.8.3] - 2026-06-10
+- Äänimerkki kun tiedot laitteelta on saatu tietokoneelle.
+- beep() (health.py:756-770) — soittaa freedesktop-teeman "complete"-merkkiäänen paplay-komennolla. Ääni menee PulseAudio/PipeWiren oletuslaitteeseen: kun kuulokkeesi ovat aamulla pois päältä, järjestelmä ohjaa äänen automaattisesti koneen
+  kaiuttimiin. Jos toisto epäonnistuu, varalla on terminaalin kellomerkki, eikä virhe koskaan keskeytä mittausten lukua.
+- Kutsu lisätty collect_devices-silmukkaan kohtaan, jossa laitteelta on saatu tiedot (health.py:835) — eli piippaus kuuluu erikseen jokaisesta laitteesta heti kun sen siirto onnistui. Näin tiedät, milloin voit lopettaa lähetysnapin painelun
+  kullakin laitteella.
+
+## [0.8.2] - 2026-06-09
+- Use own measurement class for every device
+- Read devices multiple measurements as a list
+
+  measurement.py
+  - combine_measurements_by_day(device_results) — one Measurement per calendar day; if a device has several readings on the same day, the newest (by timestamp) wins. Readings without a timestamp are skipped (can't be placed by date).
+  - write_measurements_by_date(filename, measurements) — builds a date→row index from column 1, finds each measurement's day, and fills only its non-empty metric columns (cols 2…N), leaving the pre-filled date and untouched metrics alone. Returns
+  (written, unmatched); days not found in the sheet (wrong year/month) come back as unmatched.
+  - Helpers _cell_to_date (handles datetime, date, and string forms like YYYY-MM-DD / DD.MM.YYYY) and find_measurement_sheet (locates the sheet by its "Päiväys…" header, so it works on both the Mittaukset sheet and the externally-created
+  terveysdata_* sheets).
+  - Fixed a pre-existing syntax error: line 24 was a corrupted cla instead of class DeviceMeasurement: — the module didn't import at all before this.
+
+  health.py
+  - create_new_file(filename, period, ref_date) now pre-populates one row per day — the whole year (1.1.–31.12.) or a single month, per period.
+  - load_config returns period ("month" if the filename template uses {month}, else "year").
+  - Main flow combines readings by day, creates the day-row file if missing, writes by date, and reports written days plus any unmatched ones.
+
+  Verified: 20-reading Contour list spread across days lands on correct rows; same-day duplicate BP keeps the newest; a glucose-only day doesn't wipe another day's weight; wrong-year readings reported as unmatched; works on both freshly-created
+  (datetime) and pre-built (string-date) sheets; year/month file creation produce correct day counts.
+
+  One behavior worth confirming: since the target sheet has one row per day, only one value per metric per day is kept (newest). If you'd ever want multiple same-day readings preserved, that would need a different sheet layout.
+
+## [0.8.1] - 2026-06-06
+### Added
+- Test program can produce multiple measurements. Like Contour sends about 10 measurements
+- Test program can store individual device data to spreadsheet
+
 ## [0.8.0] - 2026-06-02
 ### Added
 - Changed code to pure english
