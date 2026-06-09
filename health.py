@@ -58,9 +58,11 @@ except ImportError:
 
 from measurement import (
     Measurement,
+    DEVICE_TYPES,
     combine_measurements,
+    combine_measurements_by_day,
     save_measurements_sheet,
-    append_measurement,
+    write_measurements_by_date,
 )
 
 # ── Contour GATT UUID:t ──────────────────────────────────────────────────────
@@ -281,7 +283,7 @@ def parse_omron_bp(data: bytes) -> dict | None:
         "timestamp": timestamp,
         "systolic":  systolic,
         "diastolic": diastolic,
-        "pulse":     pulse or 0,
+        "pulse":     pulse or None,
         "user":      user,
     }
 
@@ -294,7 +296,7 @@ def on_omron_bp_notify(sender, data: bytearray):
         ts = result["timestamp"].strftime("%d.%m.%Y %H:%M") if result["timestamp"] else "?"
         print(f"  Verenpaine [{result['seq']:3d}] {ts}  "
               f"→  {result['systolic']}/{result['diastolic']} mmHg  "
-              f"syke {result['pulse']} /min")
+              f"syke {result['pulse'] or '-'} /min")
 
 
 def on_omron_racp_notify(sender, data: bytearray):
@@ -520,7 +522,11 @@ def save_to_excel(glucose: list, bp: list, scale: list, filename: str):
     wb.remove(default_sheet)
 
     # ── Mittaukset-välilehti (yhdistetty taulukko, Measurement-oliot) ────────
-    measurements = combine_measurements(glucose, bp, scale)
+    measurements = combine_measurements({
+        "contour": glucose,
+        "omron":   bp,
+        "beurer":  scale,
+    })
     save_measurements_sheet(wb, measurements)
 
     thin   = Side(style="thin", color="CCCCCC")
@@ -691,26 +697,54 @@ def save_to_excel(glucose: list, bp: list, scale: list, filename: str):
     print(f"Avaa: libreoffice --calc {filename}")
 
 
-def create_new_file(filename: str) -> None:
-    """Luo uuden Excel-tiedoston, jossa on 'Mittaukset'-välilehti otsikoineen.
+def create_new_file(filename: str, period: str = "year",
+                    ref_date: datetime | None = None) -> None:
+    """Luo uuden Excel-tiedoston 'Mittaukset'-välilehdellä, jonka ensimmäiseen
+    sarakkeeseen on valmiiksi kirjoitettu jokaisen päivän päiväys. Mittaukset
+    sijoitetaan myöhemmin oikealle päiväriville (write_measurements_by_date).
 
-    Käytetään silloin, kun tulostiedostoa ei vielä ole olemassa. Tarvittavat
-    hakemistot luodaan automaattisesti.
+    period="year"  → koko vuoden päivät (1.1.–31.12.)
+    period="month" → kyseisen kuukauden päivät (1. – kuun viimeinen päivä)
+
+    Päivät luodaan ref_date-vuoden (ja -kuukauden) mukaan; oletuksena nykyhetki.
+    Tarvittavat hakemistot luodaan automaattisesti.
     """
     from openpyxl import Workbook
+    from datetime import date, timedelta
 
     target_dir = os.path.dirname(filename)
     if target_dir:
         os.makedirs(target_dir, exist_ok=True)
 
+    ref = ref_date or datetime.now()
+    if period == "month":
+        start = date(ref.year, ref.month, 1)
+        if ref.month == 12:
+            end = date(ref.year, 12, 31)
+        else:
+            end = date(ref.year, ref.month + 1, 1) - timedelta(days=1)
+    else:
+        start = date(ref.year, 1, 1)
+        end = date(ref.year, 12, 31)
+
     wb = Workbook()
     wb.remove(wb.active)
     save_measurements_sheet(wb, [])  # luo välilehden otsikkorivillä
     # save_measurements_sheet kirjoittaa tyhjään tauluun "Ei mittauksia." -solun;
-    # poistetaan se, jotta ensimmäinen varsinainen rivi voidaan kirjoittaa rivi 2:lle.
+    # poistetaan se ennen päivärivien kirjoittamista.
     ws = wb["Mittaukset"]
     if ws.cell(2, 1).value == "Ei mittauksia.":
         ws.cell(2, 1).value = None
+
+    # Yksi rivi per päivä; päiväys ensimmäiseen sarakkeeseen.
+    row = 2
+    d = start
+    while d <= end:
+        cell = ws.cell(row=row, column=1, value=datetime(d.year, d.month, d.day))
+        cell.number_format = "YYYY-MM-DD"
+        row += 1
+        d += timedelta(days=1)
+
     wb.save(filename)
 
 
@@ -719,9 +753,36 @@ def create_new_file(filename: str) -> None:
 # POLLAUS — laitteita minuutin välein, max 30 min
 # ═══════════════════════════════════════════════════════════════════════════════
 
+BEEP_SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+
+def beep() -> None:
+    """Soittaa merkkiäänen, kun laitteelta on vastaanotettu tiedot.
+
+    Ääni soitetaan PulseAudio/PipeWiren oletuslaitteesta (paplay) — jos
+    langattomat kuulokkeet eivät ole päällä, ääni menee koneen kaiuttimiin.
+    Varalla terminaalin kellomerkki. Epäonnistuminen ei keskeytä ohjelmaa.
+    """
+    import subprocess
+    try:
+        subprocess.run(["paplay", BEEP_SOUND], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        print("\a", end="", flush=True)
+
+
+# Lukijafunktiot laiteavaimittain. DEVICE_TYPES (measurement.py) määrittää
+# laitelistan; tämä sitoo kunkin laitteen sen BLE-lukijaan. Uusi laite
+# lisätään rekisteröimällä se molempiin.
+READERS = {
+    "contour": read_contour,
+    "omron":   read_omron,
+    "beurer":  read_beurer,
+}
+
+
 async def collect_devices(macs: dict,
                           duration_minutes: int = 30,
-                          interval_seconds: int = 60) -> tuple:
+                          interval_seconds: int = 60) -> dict:
     """Skannaa annettuja laitteita kunnes kaikilta on saatu tiedot tai aika loppuu.
 
     Käydään pollauskierroksia: jokaisella kierroksella yritetään lukea jokaista
@@ -730,20 +791,15 @@ async def collect_devices(macs: dict,
     on kulunut kierroksen alusta. Lopetetaan kun kaikki valmiita tai
     `duration_minutes` minuuttia on kulunut.
 
-    macs: {"contour": MAC|None, "omron": MAC|None, "beurer": MAC|None}
-          — vain ne avaimet, joilla on MAC, ovat hakulistalla.
-    Palauttaa tuplen (glucose_list, bp_list, scale_list).
+    macs: {laiteavain: MAC|None} — vain ne avaimet, joilla on MAC ja jotka
+          löytyvät READERS-rekisteristä, ovat hakulistalla.
+    Palauttaa sanakirjan {laiteavain: [lukijan tuottamia sanakirjoja]}.
     """
-    pending = {name: mac for name, mac in macs.items() if mac}
-    results = {"contour": [], "omron": [], "beurer": []}
+    pending = {name: mac for name, mac in macs.items()
+               if mac and name in READERS}
+    results = {name: [] for name in pending}
     if not pending:
-        return [], [], []
-
-    readers = {
-        "contour": read_contour,
-        "omron":   read_omron,
-        "beurer":  read_beurer,
-    }
+        return results
 
     loop = asyncio.get_event_loop()
     deadline = loop.time() + duration_minutes * 60
@@ -764,7 +820,7 @@ async def collect_devices(macs: dict,
                 break
             mac = pending[name]
             try:
-                data = await readers[name](mac)
+                data = await READERS[name](mac)
             except Exception as e:
                 print(f"[{name}] virhe: {e}")
                 data = []
@@ -772,6 +828,7 @@ async def collect_devices(macs: dict,
                 results[name] = data
                 done_now.append(name)
                 print(f"[{name}] ✓ tiedot saatu — poistetaan hakulistalta.")
+                beep()
 
         for name in done_now:
             del pending[name]
@@ -790,54 +847,7 @@ async def collect_devices(macs: dict,
         print(f"\n⏱  Aikaraja {duration_minutes} min täynnä — ei saatu tietoja: "
               f"{', '.join(pending.keys())}")
 
-    return results["contour"], results["omron"], results["beurer"]
-
-
-def build_combined_measurement(glucose: list, bp: list, scale: list) -> Measurement:
-    """Yhdistää eri laitteiden tuoreimmat lukemat yhdeksi Measurement-olioksi.
-
-    Jokaiselta laitteelta otetaan tuorein (suurin timestamp) lukema. Olion
-    aikaleimaksi tulee tuoreimman saadun lukeman aikaleima, tai nykyhetki,
-    jos yhdelläkään lukemalla ei ole aikaleimaa.
-    """
-    m = Measurement(timestamp=datetime.now())
-    latest_ts = None
-
-    def newest(items: list) -> dict | None:
-        with_ts = [x for x in items if x.get("timestamp")]
-        if with_ts:
-            return max(with_ts, key=lambda x: x["timestamp"])
-        return items[-1] if items else None
-
-    g = newest(glucose)
-    if g:
-        m.glucose_mmol = g.get("glucose_mmol")
-        if g.get("timestamp") and (latest_ts is None or g["timestamp"] > latest_ts):
-            latest_ts = g["timestamp"]
-
-    b = newest(bp)
-    if b:
-        m.systolic  = b.get("systolic")
-        m.diastolic = b.get("diastolic")
-        m.pulse     = b.get("pulse") or None
-        if b.get("timestamp") and (latest_ts is None or b["timestamp"] > latest_ts):
-            latest_ts = b["timestamp"]
-
-    s = newest(scale)
-    if s:
-        m.weight = s.get("weight")
-        m.fat    = s.get("fat")
-        m.water  = s.get("water")
-        m.muscle = s.get("muscle")
-        m.bone   = s.get("bone")
-        m.bmr    = s.get("bmr")
-        m.amr    = s.get("amr")
-        if s.get("timestamp") and (latest_ts is None or s["timestamp"] > latest_ts):
-            latest_ts = s["timestamp"]
-
-    if latest_ts is not None:
-        m.timestamp = latest_ts
-    return m
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -845,17 +855,26 @@ def build_combined_measurement(glucose: list, bp: list, scale: list) -> Measurem
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_config(config_file: str = "settings.ini") -> dict:
-    """Lue MAC-osoitteet ja asetukset settings.ini-tiedostosta."""
+    """Lue laitelista (MAC-osoitteet) ja asetukset settings.ini-tiedostosta.
+
+    Palauttaa sanakirjan:
+        {
+          "devices":   {laiteavain: MAC|None},  # kaikki DEVICE_TYPES-avaimet
+          "directory": ...,
+          "filename":  ...,
+        }
+    [devices]-osion avaimet luetaan geneerisesti laitelistan (DEVICE_TYPES)
+    mukaan; tuntemattomista avaimista varoitetaan.
+    """
     import configparser, os
     from datetime import datetime
     config = configparser.ConfigParser()
 
     defaults = {
-        "contour":    None,
-        "omron":      None,
-        "beurer":     None,
+        "devices":   {dt.key: None for dt in DEVICE_TYPES},
         "directory":  None,
         "filename":   "terveysmittaukset.xlsx",
+        "period":     "year",
     }
 
     # Etsi asetustiedosto ohjelman hakemistosta tai nykyisestä hakemistosta
@@ -872,18 +891,26 @@ def load_config(config_file: str = "settings.ini") -> dict:
 
     config.read(found_path, encoding="utf-8")
 
-    # Lue MAC-osoitteet
+    # Lue MAC-osoitteet laitelistan mukaan
     if "devices" in config:
-        for key in ["contour", "omron", "beurer"]:
-            val = config["devices"].get(key, "").strip()
-            if val:
-                defaults[key] = val
+        for key, raw in config["devices"].items():
+            val = raw.strip()
+            if not val:
+                continue
+            if key in defaults["devices"]:
+                defaults["devices"][key] = val
+            else:
+                print(f"Huom: tuntematon laite '{key}' settings.ini:ssä — ohitetaan.")
 
     # Lue asetukset
     if "settings" in config:
         now = datetime.now()
         directory = config["settings"].get("directory", "").strip()
         filename  = config["settings"].get("filename",  "terveysmittaukset.xlsx").strip()
+
+        # Kuukausitiedosto, jos nimimallissa käytetään {month}-muuttujaa;
+        # muuten vuositiedosto. Ohjaa uuden tiedoston päivärivien laajuutta.
+        defaults["period"] = "month" if "{month}" in filename else "year"
 
         # Korvaa päivämäärämuuttujat
         filename = filename.replace("{year}",  now.strftime("%Y"))
@@ -904,86 +931,84 @@ def load_config(config_file: str = "settings.ini") -> dict:
 
 
 if __name__ == "__main__":
-    # Lue MAC-osoitteet asetustiedostosta
-    cfg = load_config()
+    cfg = load_config()                     # Lue MAC-osoitteet asetustiedostosta
 
+    devices_lines = "\n".join(
+        f"  {dt.key:<8}= {cfg['devices'].get(dt.key) or 'ei asetettu'}   ({dt.label})"
+        for dt in DEVICE_TYPES)
+    device_flags = "  ".join(f"--{dt.key}" for dt in DEVICE_TYPES)
     parser = argparse.ArgumentParser(
-        description="Terveysmittaukset BLE-lukija (Contour + Omron M7 + Beurer BF720)",
+        description="Terveysmittaukset BLE-lukija (laitelista settings.ini:stä)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 MAC-osoitteet luetaan tiedostosta settings.ini (sama hakemisto kuin ohjelma).
 Tällä hetkellä asetustiedostossa:
-  contour = {cfg['contour'] or 'ei asetettu'}
-  omron   = {cfg['omron']   or 'ei asetettu'}
-  beurer  = {cfg['beurer']  or 'ei asetettu'}
+{devices_lines}
 
 Esimerkkejä:
   python3 health.py --scan
   python3 health.py --contour        (käyttää settings.ini osoitetta)
-  python3 health.py --omron          (käyttää settings.ini osoitetta)
-  python3 health.py --beurer         (käyttää settings.ini osoitetta)
-  python3 health.py --kaikki         (lukee kaikki kolme laitetta)
+  python3 health.py --kaikki         (lukee kaikki laitelistan laitteet)
   python3 health.py --contour AA:BB:CC:DD:EE:FF  (ylikirjoittaa ini-osoitteen)
   python3 health.py --kaikki --excel toukokuu.xlsx
         """
     )
-    parser.add_argument("--scan",     action="store_true",
-                        help="Etsi BLE-laitteita lähistöltä")
-    parser.add_argument("--contour",  nargs="?", const=cfg["contour"], metavar="MAC",
-                        help="Lue verensokeri (MAC settings.ini:stä tai anna itse)")
-    parser.add_argument("--omron",    nargs="?", const=cfg["omron"],   metavar="MAC",
-                        help="Lue verenpaine (MAC settings.ini:stä tai anna itse)")
-    parser.add_argument("--beurer",   nargs="?", const=cfg["beurer"],  metavar="MAC",
-                        help="Lue paino (MAC settings.ini:stä tai anna itse)")
-    parser.add_argument("--kaikki",   action="store_true",
-                        help="Lue kaikki kolme laitetta")
-    parser.add_argument("--excel",    type=str, default=None,
-                        help=f"Tallennustiedosto (oletus: {cfg['filename']})")
-    parser.add_argument("--no-excel", action="store_true",
-                        help="Näytä tulokset vain terminaalissa")
+    parser.add_argument("--scan", action="store_true", help="Etsi BLE-laitteita lähistöltä")
+    # CLI-liput luodaan laitelistan (DEVICE_TYPES) mukaan: yksi --<avain> per laite.
+    for dt in DEVICE_TYPES:
+        parser.add_argument(f"--{dt.key}", nargs="?", const=cfg["devices"].get(dt.key),
+                            metavar="MAC",
+                            help=f"Lue {dt.label} (MAC settings.ini:stä tai anna itse)")
+    parser.add_argument("--kaikki",   action="store_true", help="Lue kaikki laitelistan laitteet")
+    parser.add_argument("--excel",    type=str, default=None, help=f"Tallennustiedosto (oletus: {cfg['filename']})")
+    parser.add_argument("--no-excel", action="store_true", help="Näytä tulokset vain terminaalissa")
     args = parser.parse_args()
 
     if args.scan:
         asyncio.run(scan_devices()); sys.exit(0)
 
-    # --kaikki käyttää ini-tiedoston osoitteita
-    if args.kaikki:
-        args.contour = args.contour or cfg["contour"]
-        args.omron   = args.omron   or cfg["omron"]
-        args.beurer  = args.beurer  or cfg["beurer"]
+    # Kokoa pollattavien laitteiden MAC-osoitteet laitelistan mukaan.
+    selected = {}
+    for dt in DEVICE_TYPES:
+        mac = getattr(args, dt.key)
+        if args.kaikki:                                                 # --kaikki täydentää ini-tiedoston osoitteilla
+            mac = mac or cfg["devices"].get(dt.key)
+        selected[dt.key] = mac
 
-    if not args.contour and not args.omron and not args.beurer:
+    if not any(selected.values()):
         parser.print_help(); sys.exit(0)
 
-    # Tarkista että MAC-osoitteet löytyvät
-    for name, mac in [("--contour", args.contour),
-                      ("--omron",   args.omron),
-                      ("--beurer",  args.beurer)]:
-        if mac == cfg.get(name.lstrip("-")) and not mac:
-            print(f"Virhe: {name} MAC-osoite puuttuu settings.ini-tiedostosta!")
-            sys.exit(1)
+    excel_file = args.excel or cfg["filename"]                          # Tulostiedoston polku settings.ini:stä (sisältää esim. vuoden).
 
-    # Pollataan kaikkia annettuja laitteita minuutin välein max 30 min.
-    glucose_results, bp_results, scale_results = asyncio.run(
-        collect_devices({
-            "contour": args.contour,
-            "omron":   args.omron,
-            "beurer":  args.beurer,
-        })
+    device_results = asyncio.run(                                       # Pollataan kaikkia annettuja laitteita minuutin välein max 30 min.
+        collect_devices(selected)
     )
 
-    if not glucose_results and not bp_results and not scale_results:
+    if not any(device_results.values()):
         print("\nEi mittauksia saatu yhdeltäkään laitteelta."); sys.exit(1)
 
-    excel_file = args.excel or cfg["filename"]
     if not args.no_excel:
-        if not os.path.exists(excel_file):
-            create_new_file(excel_file)
-            print(f"Luotu uusi tiedosto otsikkorivillä: {excel_file}")
+        # Laite voi palauttaa useita lukemia (esim. Contour ~20 verensokeria).
+        # Kootaan kaikki päivätasolle: yksi Measurement per kalenteripäivä.
+        measurements = combine_measurements_by_day(device_results)
 
-        m = build_combined_measurement(glucose_results, bp_results, scale_results)
-        print(f"\nLisätään uusi rivi tiedostoon {excel_file}:")
-        for (header, _), value in zip(Measurement.COLUMNS, m.to_row()):
-            print(f"  {header:<28} {value if value not in (None, '') else '-'}")
-        append_measurement(excel_file, m)
-        print(f"\nMittaus tallennettu onnistuneesti.")
+        if not os.path.exists(excel_file):                              # Luo päiväpohjainen tiedosto, jos sitä ei vielä ole.
+            create_new_file(excel_file, period=cfg["period"])
+            print(f"Luotu uusi päiväpohjainen tiedosto: {excel_file}")
+
+        print(f"\nKirjoitetaan {len(measurements)} mittauspäivää tiedostoon {excel_file}:")
+        for m in measurements:
+            day = m.timestamp.strftime("%d.%m.%Y") if m.timestamp else "?"
+            vals = ", ".join(
+                f"{header}={value}"
+                for (header, _), value in zip(Measurement.COLUMNS[1:], m.to_row()[1:])
+                if value not in (None, ""))
+            print(f"  {day}: {vals or '-'}")
+
+        written, unmatched = write_measurements_by_date(excel_file, measurements)  # Etsii oikean päivärivin ja täyttää sen.
+        print(f"\n{written} päivän mittaukset tallennettu tiedostoon {excel_file}.")
+        if unmatched:
+            print(f"⚠  {len(unmatched)} mittauspäivää ei voitu sijoittaa — "
+                  f"päivää ei löytynyt taulukosta (onko vuosi/kuukausi oikea?):")
+            for m in unmatched:
+                print(f"     {m.timestamp.strftime('%d.%m.%Y') if m.timestamp else '?'}")
