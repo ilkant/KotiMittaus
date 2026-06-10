@@ -1,5 +1,25 @@
 KotiMittaus ohjelmien Changelog.
 
+## [0.8.5] - 2026-06-10
+- settings.ini — uusi asetus log_level (oletus koodissa 0, ini:ssä nyt 1):
+  - 0 = ei kirjoiteta mitään
+  - 1 = "Tiedot saatu laitteelta X (laitteen nimi): N lukemaa"
+  - 2 = yksityiskohtaisempi suoritus: pollauksen alku/asetukset, kierrokset, lukuyritykset, virheet, keskeytys/aikaraja, Excel-tallennus
+  - 4 = kaikki näytölle tulostettava teksti peilataan lokiin (3 toimii kuten 2)
+
+## [0.8.4] - 2026-06-10
+ settings.ini — uudet asetukset [settings]-osioon:
+  - polling_interval = 60 — pollauskierrosten väli sekunteina
+  - polling_time = 30 — pollauksen enimmäiskesto minuutteina
+  - quit_shortcut = q — keskeytysnäppäin
+
+  health.py:
+  - load_config() (health.py:920) lukee uudet asetukset; virheellinen luku → oletukset, quit_shortcut-arvosta käytetään ensimmäinen merkki
+  - start_quit_listener() (health.py:776) — asettaa terminaalin cbreak-tilaan ja kuuntelee näppäimistöä asyncio-loopissa; palauttaa terminaalin ennalleen lopuksi. Putkitetussa ajossa (ei tty) kuuntelija ohitetaan.
+  - collect_devices() (health.py:809) — sai quit_key-parametrin; q-painallus keskeyttää odotuksen heti (asyncio.wait_for(quit_event.wait(), ...)) ja lopettaa kierrokset. Huomaa: kesken aktiivisen BLE-luvun painallus huomioidaan vasta luvun
+  päätyttyä.
+  - Pääohjelma välittää asetukset collect_devices-kutsuun (health.py:1052)
+
 ## [0.8.3] - 2026-06-10
 - Äänimerkki kun tiedot laitteelta on saatu tietokoneelle.
 - beep() (health.py:756-770) — soittaa freedesktop-teeman "complete"-merkkiäänen paplay-komennolla. Ääni menee PulseAudio/PipeWiren oletuslaitteeseen: kun kuulokkeesi ovat aamulla pois päältä, järjestelmä ohjaa äänen automaattisesti koneen
