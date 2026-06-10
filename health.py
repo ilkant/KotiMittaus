@@ -750,7 +750,72 @@ def create_new_file(filename: str, period: str = "year",
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# POLLAUS — laitteita minuutin välein, max 30 min
+# LOKITUS — tapahtumat tiedostoon kotimittaus.log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kotimittaus.log")
+
+
+class Log:
+    """Tapahtumaloki tiedostoon kotimittaus.log. Taso luetaan settings.ini:n
+    log_level-asetuksesta (pääohjelma asettaa log.level-attribuutin).
+
+    Tasot:
+      0 = ei kirjoiteta mitään
+      1 = tiedot saatu laitteelta + lukemien lukumäärä
+      2 = yksityiskohtaisempaa tietoa ohjelman suorituksesta
+      4 = kaikki näytölle tulostettava teksti (TeeStdout peilaa sen lokiin)
+
+    Viesti kirjoitetaan, kun sen taso ≤ asetettu taso, joten ylempi taso
+    sisältää aina alempien tasojen viestit. Lokirivin muoto:
+        2026-06-10 08:15:00 [1] Tiedot saatu laitteelta ...
+    Lokitiedoston kirjoitusvirhe ei koskaan keskeytä mittausten lukua.
+    """
+
+    def __init__(self):
+        self.level = 0
+
+    def write(self, level: int, msg: str) -> None:
+        if self.level < level:
+            return
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {msg}\n")
+        except OSError:
+            pass
+
+
+log = Log()
+
+
+class TeeStdout:
+    """Peilaa kaiken näytölle tulostettavan tekstin lokiin rivi kerrallaan
+    (taso 4). Pääohjelma asentaa tämän sys.stdoutin tilalle kun log_level ≥ 4.
+    Tyhjät rivit ohitetaan; muut attribuutit (isatty, fileno, …) delegoidaan
+    alkuperäiselle virralle.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer = ""
+
+    def write(self, text):
+        self._stream.write(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                log.write(4, line)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POLLAUS — laitteita polling_interval-sekunnin välein, max polling_time min
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BEEP_SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
@@ -770,6 +835,39 @@ def beep() -> None:
         print("\a", end="", flush=True)
 
 
+def start_quit_listener(quit_event: asyncio.Event, quit_key: str):
+    """Käynnistää näppäimistökuuntelijan, joka asettaa quit_eventin kun
+    käyttäjä painaa quit_key-näppäintä (oletus 'q', luetaan settings.ini:stä).
+
+    Terminaali asetetaan cbreak-tilaan, jotta näppäin saadaan ilman Enteriä.
+    Palauttaa funktion, joka palauttaa terminaalin ennalleen — kutsuttava
+    pollauksen päätteeksi (finally). Jos stdin ei ole terminaali (esim.
+    putkitettu ajo), kuuntelijaa ei käynnistetä ja palautetaan None.
+    """
+    import termios, tty
+    if not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except termios.error:
+        return None
+    loop = asyncio.get_event_loop()
+
+    def on_key():
+        ch = os.read(fd, 1).decode(errors="ignore")
+        if ch.lower() == quit_key.lower():
+            quit_event.set()
+
+    loop.add_reader(fd, on_key)
+
+    def restore():
+        loop.remove_reader(fd)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    return restore
+
+
 # Lukijafunktiot laiteavaimittain. DEVICE_TYPES (measurement.py) määrittää
 # laitelistan; tämä sitoo kunkin laitteen sen BLE-lukijaan. Uusi laite
 # lisätään rekisteröimällä se molempiin.
@@ -779,17 +877,23 @@ READERS = {
     "beurer":  read_beurer,
 }
 
+# Laitteiden selkokieliset nimet lokiviestejä varten
+DEVICE_LABELS = {dt.key: dt.label for dt in DEVICE_TYPES}
+
 
 async def collect_devices(macs: dict,
                           duration_minutes: int = 30,
-                          interval_seconds: int = 60) -> dict:
+                          interval_seconds: int = 60,
+                          quit_key: str = "q") -> dict:
     """Skannaa annettuja laitteita kunnes kaikilta on saatu tiedot tai aika loppuu.
 
     Käydään pollauskierroksia: jokaisella kierroksella yritetään lukea jokaista
     hakulistalla vielä olevaa laitetta. Kun joltain laitteelta saadaan tiedot,
-    se poistetaan hakulistalta. Kierrosten välillä odotetaan kunnes minuutti
-    on kulunut kierroksen alusta. Lopetetaan kun kaikki valmiita tai
-    `duration_minutes` minuuttia on kulunut.
+    se poistetaan hakulistalta. Kierrosten välillä odotetaan kunnes
+    `interval_seconds` sekuntia on kulunut kierroksen alusta. Lopetetaan kun
+    kaikki valmiita, `duration_minutes` minuuttia on kulunut tai käyttäjä
+    painaa quit_key-näppäintä (keskeytys huomioidaan kierrosten välissä,
+    ei kesken BLE-luvun).
 
     macs: {laiteavain: MAC|None} — vain ne avaimet, joilla on MAC ja jotka
           löytyvät READERS-rekisteristä, ovat hakulistalla.
@@ -801,51 +905,82 @@ async def collect_devices(macs: dict,
     if not pending:
         return results
 
+    log.write(2, f"Pollaus alkaa: laitteet {', '.join(pending)}; "
+                 f"kierrosväli {interval_seconds} s, enimmäiskesto {duration_minutes} min")
+
     loop = asyncio.get_event_loop()
     deadline = loop.time() + duration_minutes * 60
 
-    round_num = 0
-    while pending and loop.time() < deadline:
-        round_num += 1
-        round_start = loop.time()
-        remaining_min = (deadline - round_start) / 60
-        print(f"\n{'═' * 70}")
-        print(f"  Kierros {round_num}  ·  jäljellä {len(pending)} laitetta "
-              f"({', '.join(pending.keys())})  ·  aikaa {remaining_min:.1f} min")
-        print(f"{'═' * 70}")
+    quit_event = asyncio.Event()
+    restore_terminal = start_quit_listener(quit_event, quit_key)
+    if restore_terminal:
+        print(f"\n[Pollaus] Keskeytä painamalla '{quit_key}'.")
 
-        done_now = []
-        for name in list(pending.keys()):
-            if loop.time() >= deadline:
+    try:
+        round_num = 0
+        while pending and loop.time() < deadline and not quit_event.is_set():
+            round_num += 1
+            round_start = loop.time()
+            remaining_min = (deadline - round_start) / 60
+            print(f"\n{'═' * 70}")
+            print(f"  Kierros {round_num}  ·  jäljellä {len(pending)} laitetta "
+                  f"({', '.join(pending.keys())})  ·  aikaa {remaining_min:.1f} min")
+            print(f"{'═' * 70}")
+            log.write(2, f"Kierros {round_num}: jäljellä {', '.join(pending)}; "
+                         f"aikaa {remaining_min:.1f} min")
+
+            done_now = []
+            for name in list(pending.keys()):
+                if loop.time() >= deadline or quit_event.is_set():
+                    break
+                mac = pending[name]
+                log.write(2, f"Luetaan laitetta {name} ({mac})")
+                try:
+                    data = await READERS[name](mac)
+                except Exception as e:
+                    print(f"[{name}] virhe: {e}")
+                    log.write(2, f"Laitteen {name} luku epäonnistui: {e}")
+                    data = []
+                if data:
+                    results[name] = data
+                    done_now.append(name)
+                    print(f"[{name}] ✓ tiedot saatu — poistetaan hakulistalta.")
+                    log.write(1, f"Tiedot saatu laitteelta {name} "
+                                 f"({DEVICE_LABELS.get(name, name)}): {len(data)} lukemaa")
+                    beep()
+
+            for name in done_now:
+                del pending[name]
+
+            if not pending or loop.time() >= deadline or quit_event.is_set():
                 break
-            mac = pending[name]
-            try:
-                data = await READERS[name](mac)
-            except Exception as e:
-                print(f"[{name}] virhe: {e}")
-                data = []
-            if data:
-                results[name] = data
-                done_now.append(name)
-                print(f"[{name}] ✓ tiedot saatu — poistetaan hakulistalta.")
-                beep()
 
-        for name in done_now:
-            del pending[name]
+            elapsed = loop.time() - round_start
+            wait = min(max(0.0, interval_seconds - elapsed),
+                       max(0.0, deadline - loop.time()))
+            if wait > 0:
+                print(f"\n[Odotetaan {wait:.0f} s seuraavaan pollauskierrokseen — "
+                      f"keskeytä painamalla '{quit_key}'…]")
+                try:
+                    await asyncio.wait_for(quit_event.wait(), timeout=wait)
+                except asyncio.TimeoutError:
+                    pass
+    finally:
+        if restore_terminal:
+            restore_terminal()
 
-        if not pending or loop.time() >= deadline:
-            break
-
-        elapsed = loop.time() - round_start
-        wait = min(max(0.0, interval_seconds - elapsed),
-                   max(0.0, deadline - loop.time()))
-        if wait > 0:
-            print(f"\n[Odotetaan {wait:.0f} s seuraavaan pollauskierrokseen…]")
-            await asyncio.sleep(wait)
-
-    if pending:
+    if quit_event.is_set():
+        print(f"\n⏹  Pollaus keskeytetty näppäimellä '{quit_key}'"
+              + (f" — ei saatu tietoja: {', '.join(pending.keys())}" if pending else "."))
+        log.write(2, f"Pollaus keskeytetty näppäimellä '{quit_key}'"
+                     + (f"; ilman tietoja jäi: {', '.join(pending)}" if pending else ""))
+    elif pending:
         print(f"\n⏱  Aikaraja {duration_minutes} min täynnä — ei saatu tietoja: "
               f"{', '.join(pending.keys())}")
+        log.write(2, f"Aikaraja {duration_minutes} min täynnä; "
+                     f"ilman tietoja jäi: {', '.join(pending)}")
+    else:
+        log.write(2, "Pollaus valmis: kaikilta laitteilta saatiin tiedot")
 
     return results
 
@@ -859,9 +994,13 @@ def load_config(config_file: str = "settings.ini") -> dict:
 
     Palauttaa sanakirjan:
         {
-          "devices":   {laiteavain: MAC|None},  # kaikki DEVICE_TYPES-avaimet
-          "directory": ...,
-          "filename":  ...,
+          "devices":          {laiteavain: MAC|None},  # kaikki DEVICE_TYPES-avaimet
+          "directory":        ...,
+          "filename":         ...,
+          "polling_interval": pollauskierrosten väli sekunteina,
+          "polling_time":     pollauksen enimmäiskesto minuutteina,
+          "quit_shortcut":    näppäin, jolla pollauksen voi keskeyttää,
+          "log_level":        lokitustaso 0–4 (ks. Log-luokka),
         }
     [devices]-osion avaimet luetaan geneerisesti laitelistan (DEVICE_TYPES)
     mukaan; tuntemattomista avaimista varoitetaan.
@@ -875,6 +1014,10 @@ def load_config(config_file: str = "settings.ini") -> dict:
         "directory":  None,
         "filename":   "terveysmittaukset.xlsx",
         "period":     "year",
+        "polling_interval": 60,
+        "polling_time":     30,
+        "quit_shortcut":    "q",
+        "log_level":        0,
     }
 
     # Etsi asetustiedosto ohjelman hakemistosta tai nykyisestä hakemistosta
@@ -925,6 +1068,27 @@ def load_config(config_file: str = "settings.ini") -> dict:
 
         defaults["directory"] = directory or script_dir
 
+        # Pollauksen asetukset
+        try:
+            defaults["polling_interval"] = config["settings"].getint(
+                "polling_interval", fallback=defaults["polling_interval"])
+            defaults["polling_time"] = config["settings"].getint(
+                "polling_time", fallback=defaults["polling_time"])
+        except ValueError:
+            print("Huom: polling_interval/polling_time ei ole kokonaisluku "
+                  "settings.ini:ssä — käytetään oletuksia.")
+        quit_key = config["settings"].get("quit_shortcut", "").strip()
+        if quit_key:
+            defaults["quit_shortcut"] = quit_key[0]
+
+        # Lokitustaso
+        try:
+            defaults["log_level"] = max(0, config["settings"].getint(
+                "log_level", fallback=defaults["log_level"]))
+        except ValueError:
+            print("Huom: log_level ei ole kokonaisluku settings.ini:ssä "
+                  "— lokitus pois päältä.")
+
     return defaults
 
 
@@ -932,6 +1096,10 @@ def load_config(config_file: str = "settings.ini") -> dict:
 
 if __name__ == "__main__":
     cfg = load_config()                     # Lue MAC-osoitteet asetustiedostosta
+
+    log.level = cfg["log_level"]            # Lokitus päälle settings.ini:n mukaan
+    if log.level >= 4:
+        sys.stdout = TeeStdout(sys.stdout)  # Taso 4: peilaa kaikki tulosteet lokiin
 
     devices_lines = "\n".join(
         f"  {dt.key:<8}= {cfg['devices'].get(dt.key) or 'ei asetettu'}   ({dt.label})"
@@ -980,12 +1148,21 @@ Esimerkkejä:
 
     excel_file = args.excel or cfg["filename"]                          # Tulostiedoston polku settings.ini:stä (sisältää esim. vuoden).
 
-    device_results = asyncio.run(                                       # Pollataan kaikkia annettuja laitteita minuutin välein max 30 min.
-        collect_devices(selected)
+    log.write(2, f"Ohjelma käynnistyi; laitteet: "
+                 f"{', '.join(k for k, v in selected.items() if v) or '-'}; "
+                 f"tulostiedosto {excel_file}")
+
+    device_results = asyncio.run(                                       # Pollataan laitteita settings.ini:n asetusten mukaan.
+        collect_devices(selected,
+                        duration_minutes=cfg["polling_time"],
+                        interval_seconds=cfg["polling_interval"],
+                        quit_key=cfg["quit_shortcut"])
     )
 
     if not any(device_results.values()):
-        print("\nEi mittauksia saatu yhdeltäkään laitteelta."); sys.exit(1)
+        print("\nEi mittauksia saatu yhdeltäkään laitteelta.")
+        log.write(2, "Ohjelma päättyi: ei mittauksia yhdeltäkään laitteelta")
+        sys.exit(1)
 
     if not args.no_excel:
         # Laite voi palauttaa useita lukemia (esim. Contour ~20 verensokeria).
@@ -995,6 +1172,7 @@ Esimerkkejä:
         if not os.path.exists(excel_file):                              # Luo päiväpohjainen tiedosto, jos sitä ei vielä ole.
             create_new_file(excel_file, period=cfg["period"])
             print(f"Luotu uusi päiväpohjainen tiedosto: {excel_file}")
+            log.write(2, f"Luotu uusi päiväpohjainen tiedosto: {excel_file}")
 
         print(f"\nKirjoitetaan {len(measurements)} mittauspäivää tiedostoon {excel_file}:")
         for m in measurements:
@@ -1007,6 +1185,8 @@ Esimerkkejä:
 
         written, unmatched = write_measurements_by_date(excel_file, measurements)  # Etsii oikean päivärivin ja täyttää sen.
         print(f"\n{written} päivän mittaukset tallennettu tiedostoon {excel_file}.")
+        log.write(2, f"{written} päivän mittaukset tallennettu tiedostoon {excel_file}"
+                     + (f"; {len(unmatched)} päivää ilman päiväriviä" if unmatched else ""))
         if unmatched:
             print(f"⚠  {len(unmatched)} mittauspäivää ei voitu sijoittaa — "
                   f"päivää ei löytynyt taulukosta (onko vuosi/kuukausi oikea?):")
